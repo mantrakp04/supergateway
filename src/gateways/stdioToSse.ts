@@ -20,6 +20,7 @@ export interface StdioToSseArgs {
   corsOrigin: CorsOptions['origin']
   healthEndpoints: string[]
   headers: Record<string, string>
+  idleTimeoutMinutes: number
 }
 
 const setResponseHeaders = ({
@@ -44,6 +45,7 @@ export async function stdioToSse(args: StdioToSseArgs) {
     corsOrigin,
     healthEndpoints,
     headers,
+    idleTimeoutMinutes,
   } = args
 
   logger.info(
@@ -64,11 +66,56 @@ export async function stdioToSse(args: StdioToSseArgs) {
     `  - Health endpoints: ${healthEndpoints.length ? healthEndpoints.join(', ') : '(none)'}`,
   )
 
+  if (idleTimeoutMinutes && idleTimeoutMinutes > 0) {
+    logger.info(`  - Idle timeout: ${idleTimeoutMinutes} minutes`)
+  } else {
+    logger.info('  - Idle timeout: disabled (default)')
+  }
+
   onSignals({ logger })
 
   const child: ChildProcessWithoutNullStreams = spawn(stdioCmd, { shell: true })
+
+  const sessions: Record<
+    string,
+    { transport: SSEServerTransport; response: express.Response }
+  > = {}
+
+  let idleTimeout: NodeJS.Timeout
+  const IDLE_TIMEOUT_MS = idleTimeoutMinutes * 60 * 1000
+
+  const resetIdleTimeout = () => {
+    if (idleTimeout) {
+      clearTimeout(idleTimeout)
+    }
+    if (!idleTimeoutMinutes || idleTimeoutMinutes <= 0) {
+      return
+    }
+
+    if (Object.keys(sessions).length === 0) {
+      idleTimeout = setTimeout(() => {
+        logger.info(
+          `Server idle for ${idleTimeoutMinutes} minutes (no active SSE connections), shutting down.`,
+        )
+        child.kill()
+        process.exit(0)
+      }, IDLE_TIMEOUT_MS)
+      logger.info(
+        `Idle timer started: ${idleTimeoutMinutes} minutes. No active SSE connections.`,
+      )
+    } else {
+      logger.info(
+        `Idle timer cleared/paused. Active sessions: ${Object.keys(sessions).length}.`,
+      )
+    }
+  }
+
+  // Initialize the idle timeout when the server starts
+  resetIdleTimeout()
+
   child.on('exit', (code, signal) => {
     logger.error(`Child exited: code=${code}, signal=${signal}`)
+    if (idleTimeout) clearTimeout(idleTimeout)
     process.exit(code ?? 1)
   })
 
@@ -76,11 +123,6 @@ export async function stdioToSse(args: StdioToSseArgs) {
     { name: 'supergateway', version: getVersion() },
     { capabilities: {} },
   )
-
-  const sessions: Record<
-    string,
-    { transport: SSEServerTransport; response: express.Response }
-  > = {}
 
   const app = express()
 
@@ -117,6 +159,7 @@ export async function stdioToSse(args: StdioToSseArgs) {
     const sessionId = sseTransport.sessionId
     if (sessionId) {
       sessions[sessionId] = { transport: sseTransport, response: res }
+      resetIdleTimeout()
     }
 
     sseTransport.onmessage = (msg: JSONRPCMessage) => {
@@ -126,17 +169,26 @@ export async function stdioToSse(args: StdioToSseArgs) {
 
     sseTransport.onclose = () => {
       logger.info(`SSE connection closed (session ${sessionId})`)
-      delete sessions[sessionId]
+      if (sessionId && sessions[sessionId]) {
+        delete sessions[sessionId]
+      }
+      resetIdleTimeout()
     }
 
     sseTransport.onerror = (err) => {
       logger.error(`SSE error (session ${sessionId}):`, err)
-      delete sessions[sessionId]
+      if (sessionId && sessions[sessionId]) {
+        delete sessions[sessionId]
+      }
+      resetIdleTimeout()
     }
 
     req.on('close', () => {
       logger.info(`Client disconnected (session ${sessionId})`)
-      delete sessions[sessionId]
+      if (sessionId && sessions[sessionId]) {
+        delete sessions[sessionId]
+      }
+      resetIdleTimeout()
     })
   })
 
@@ -166,6 +218,7 @@ export async function stdioToSse(args: StdioToSseArgs) {
     logger.info(`Listening on port ${port}`)
     logger.info(`SSE endpoint: http://localhost:${port}${ssePath}`)
     logger.info(`POST messages: http://localhost:${port}${messagePath}`)
+    // Initial timeout is already set before listener starts
   })
 
   let buffer = ''
@@ -194,5 +247,9 @@ export async function stdioToSse(args: StdioToSseArgs) {
 
   child.stderr.on('data', (chunk: Buffer) => {
     logger.error(`Child stderr: ${chunk.toString('utf8')}`)
+  })
+
+  process.on('exit', () => {
+    if (idleTimeout) clearTimeout(idleTimeout)
   })
 }

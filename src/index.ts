@@ -105,6 +105,11 @@ async function main() {
       description:
         'Authorization header to be added, e.g. --oauth2Bearer "some-access-token" adds "Authorization: Bearer some-access-token"',
     })
+    .option('idle-timeout-mins', {
+      type: 'number',
+      description:
+        '(stdio→SSE) Number of minutes of inactivity before the server shuts down. Disabled by default. Provide a value > 0 to enable.',
+    })
     .help()
     .parseSync()
 
@@ -155,6 +160,10 @@ async function main() {
             argv,
             logger,
           }),
+          idleTimeoutMinutes:
+            argv.idleTimeoutMins && argv.idleTimeoutMins > 0
+              ? argv.idleTimeoutMins
+              : 0,
         })
       } else if (argv.outputTransport === 'ws') {
         await stdioToWs({
